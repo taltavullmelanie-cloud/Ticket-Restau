@@ -480,104 +480,73 @@ function hasKeywordNear(s: string, keyword: RegExp, index: number, before = 10, 
   return keyword.test(s.slice(start, end));
 }
 
-function parseTicketFromText(rawText: string) {
-  // --- Normalisation robuste pour l'OCR ---
-  const text = rawText
-    .replace(/\r/g, "\n")
-    .replace(/\u00A0/g, " ")               // espaces insécables
-    .replace(/[’']/g, "'")
-    .replace(/[“”]/g, '"')
-    .replace(/[‐-–—]/g, "-");               // différents tirets
+function parseTicketFromText(text: string) {
+  // --- Normalisation basique (ton helper existant si tu l’as déjà) ---
+  const normalized = normalizeOCR ? normalizeOCR(text) : text.replace(/[^\S\r\n]+/g, " ");
+  const upper = normalized.toUpperCase();
+  const upperDigits = upper; // utile pour les regex A-Z/0-9
 
-  const upper = text
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")        // retire accents
-    .toUpperCase();
+  // --- Type & Provider ---
+  const hasTRWords = /\b(TITRE\S*RESTAURANT|TICKET\S*RESTAURANT|CONECS)\b/.test(upper);
+  const isCard = /\b(VISA|MASTERCARD|CB|EMV|CONTACTLESS|SANS\s*CONTACT)\b/.test(upper);
+  const isConnect = /\b(EDENRED|TICKET\s*RESTAURANT|PLUXEE|SODEXO|SWILE|BIMPLI|APETIZ|UP(?:\s*D[ÉE]JEUNER)?|CH[ÈE]QUE\s*D[ÉE]JEUNER|\bTR\b)\b/.test(upper);
 
-  // Petites corrections d’OCR fréquentes dans les chiffres
-  const upperDigits = upper
-    // exemple : I0I -> 101 ; O confondu avec 0 quand entouré de chiffres
-    .replace(/(?<=\d)O(?=\d)/g, "0")
-    .replace(/(?<=\d)I(?=\d)/g, "1")
-    .replace(/(?<=\d)S(?=\d)/g, "5");
-
-  // -----------------------------
-  // 1) Détection Carte vs Connect
-  // -----------------------------
-  const isCard = /\b(VISA|MASTERCARD|CB|EMV|CONTACTLESS|SANS\s*CONTACT)\b/.test(upperDigits);
-  const isConnect = /\b(EDENRED|TICKET\s*RESTAURANT|PLUXEE|SODEXO|SWILE|BIMPLI|APETIZ|UP(?:\s*DEJEUNER)?|CHEQUE\s*DEJEUNER|TR\b)\b/.test(upperDigits);
-
-  // -----------------------------
-  // 2) Prestataire
-  // -----------------------------
   let provider = "—";
-  if (/\bEDENRED|TICKET\s*RESTAURANT\b/.test(upperDigits)) provider = "Edenred (Connect)";
-  else if (/\bPLUXEE|SODEXO\b/.test(upperDigits)) provider = "Pluxee (Connect)";
-  else if (/\bSWILE\b/.test(upperDigits)) provider = "Swile (Connect)";
-  else if (/\bBIMPLI|APETIZ\b/.test(upperDigits)) provider = "Bimpli (Connect)";
-  else if (/\bUP(?:\s*DEJEUNER)?|CHEQUE\s*DEJEUNER\b/.test(upperDigits)) provider = "Up Déjeuner (Connect)";
+  if (/\bEDENRED|TICKET\s*RESTAURANT\b/.test(upper)) provider = "Edenred / Ticket Restaurant (Connect)";
+  else if (/\bCONECS\b/.test(upper)) provider = "Conecs (Connect)";
+  else if (/\bPLUXEE|SODEXO\b/.test(upper)) provider = "Pluxee (Connect)";
+  else if (/\bSWILE\b/.test(upper)) provider = "Swile (Connect)";
+  else if (/\bBIMPLI|APETIZ\b/.test(upper)) provider = "Bimpli (Connect)";
+  else if (/\bUP(?:\s*D[ÉE]JEUNER)?|CH[ÈE]QUE\s*D[ÉE]JEUNER\b/.test(upper)) provider = "Up Déjeuner (Connect)";
+  else if (isCard && hasTRWords) provider = "TR Mastercard (carte)";
   else if (isCard) provider = "Inconnu (rails bancaires)";
 
-  // -----------------------------
-  // 3) Montant (prend en priorité après 'MONTANT')
-  // -----------------------------
+  // --- Montant ---
   let amount: number | null = null;
-
-  // a) si "MONTANT" présent, on essaie d'abord là
-  const afterMontant = upperDigits.match(/MONTANT[^\d]{0,20}(\d{1,3}(?:[ .]\d{3})*[.,]\d{2})/);
-  if (afterMontant) {
-    amount = parseFloat(afterMontant[1].replace(/[ .]/g, "").replace(",", "."));
-  }
-
-  // b) fallback : meilleur nombre en € dans tout le texte
-  if (amount === null) {
-    const candidates = Array.from(
-      upperDigits.matchAll(/\b(\d{1,3}(?:[ .]\d{3})*[.,]\d{2})\s*(?:€|EUR)?\b/g)
-    ).map(m => parseFloat(m[1].replace(/[ .]/g, "").replace(",", ".")));
-
-    if (candidates.length > 0) {
-      // on prend le max pour éviter les faux 0,50 etc. dans les totaux techniques
-      amount = candidates.sort((a, b) => b - a)[0];
+  // 1) “MONTANT … 25,00 €” prioritaire
+  const m1 = normalized.match(/MONTANT[^\d]{0,12}(\d+\s?[.,]\s?\d{2})\s*(€|EUR)?/i);
+  if (m1) {
+    amount = parseFloat(m1[1].replace(/\s/g, "").replace(",", "."));
+  } else {
+    // 2) fallback : prendre le plus “grand” montant plausible
+    const all = [...normalized.matchAll(/(\d{1,4}\s?[.,]\s?\d{2})\s*(€|EUR)?/gi)].map(m => ({
+      value: parseFloat(m[1].replace(/\s/g, "").replace(",", ".")),
+    }));
+    if (all.length) {
+      amount = all.map(a => a.value).sort((a, b) => b - a)[0];
     }
   }
 
-  // -----------------------------
-  // 4) Date (dd/mm/yy(yy), accepte séparateurs et espaces OCR)
-  // -----------------------------
+  // --- Date ---
   let date: string | null = null;
-
-  // formats tolérés : 19/08/25, 19-08-2025, 19 . 08 . 25, etc.
-  const dateMatch =
-    upperDigits.match(/\b(0?\d|[12]\d|3[01])\s*[/\-.]\s*(0?\d|1[0-2])\s*[/\-.]\s*(\d{2}|\d{4})\b/) ||
-    null;
-
-  if (dateMatch) {
-    let dd = dateMatch[1].padStart(2, "0");
-    let mm = dateMatch[2].padStart(2, "0");
-    let yyyy = dateMatch[3];
-
-    if (yyyy.length === 2) {
-      // on suppose 20xx pour les TR modernes
-      const yy = parseInt(yyyy, 10);
-      yyyy = (2000 + yy).toString();
-    }
-    date = `${dd}/${mm}/${yyyy}`;
+  const dateRe = /\b(0?\d|[12]\d|3[01])\s*[/\-.]\s*(0?\d|1[0-2])\s*[/\-.]\s*(\d{2}|\d{4})\b/gi;
+  const matches: Array<{idx: number; d: string; dd: string; mm: string; yy: string}> = [];
+  for (const m of upper.matchAll(dateRe) as any) {
+    const idx = m.index as number;
+    const dd = m[1].toString().padStart(2, "0");
+    const mm = m[2].toString().padStart(2, "0");
+    let yy = m[3].toString();
+    if (yy.length === 2) yy = (2000 + parseInt(yy, 10)).toString();
+    matches.push({ idx, d: `${dd}/${mm}/${yy}`, dd, mm, yy });
+  }
+  if (matches.length) {
+    // Heuristique : date précédée de “ LE ” ou suivie d’une heure “ A 11:45”
+    const hasLE = (i: number) => upper.slice(Math.max(0, i - 6), i + 2).includes(" LE");
+    const hasHour = (i: number) => /\sA\s\d{1,2}[:H]\d{2}/i.test(upper.slice(i, i + 20));
+    const scored = matches
+      .map(m => ({ ...m, score: (hasLE(m.idx) ? 2 : 0) + (hasHour(m.idx) ? 1 : 0) }))
+      .sort((a, b) => b.score - a.score || a.idx - b.idx);
+    date = scored[0].d;
   }
 
-  // -----------------------------
-  // 5) N° d'autorisation (si présent)
-  // -----------------------------
+  // --- N° d’autorisation (doublons) ---
   let auth: string | null = null;
-  // Cherche un bloc après AUTORISATION / AUTH / NO AUTO…
-  const mAuth =
+  const auth1 =
     upperDigits.match(/(?:\bNO?\s*AUTO\b|\bAUTH(?:ORISATION|ORIZATION)?\b|AUTORISATION)\s*[:\-]?\s*([A-Z0-9]{6,})/) ||
     upperDigits.match(/\bNO\s*AUTO[:\-]?\s*([A-Z0-9]{6,})/);
+  if (auth1) auth = auth1[1];
 
-  if (mAuth) auth = mAuth[1];
-
-  // -----------------------------
-  // 6) Score (confiance 1..5)
-  // -----------------------------
+  // --- Confiance (1..5) ---
   let conf = 0;
   if (isCard) conf += 2;
   if (isConnect) conf += 2;
@@ -595,3 +564,4 @@ function parseTicketFromText(rawText: string) {
     auth,
   };
 }
+
