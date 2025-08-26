@@ -481,10 +481,10 @@ function hasKeywordNear(s: string, keyword: RegExp, index: number, before = 10, 
 }
 
 function parseTicketFromText(text: string) {
-  // --- Normalisation basique (ton helper existant si tu l’as déjà) ---
-  const normalized = normalizeOCR ? normalizeOCR(text) : text.replace(/[^\S\r\n]+/g, " ");
+  // Normalisation simple (pas d’appel externe)
+  const normalized = text.replace(/[^\S\r\n]+/g, " ");
   const upper = normalized.toUpperCase();
-  const upperDigits = upper; // utile pour les regex A-Z/0-9
+  const upperDigits = upper;
 
   // --- Type & Provider ---
   const hasTRWords = /\b(TITRE\S*RESTAURANT|TICKET\S*RESTAURANT|CONECS)\b/.test(upper);
@@ -508,45 +508,54 @@ function parseTicketFromText(text: string) {
   if (m1) {
     amount = parseFloat(m1[1].replace(/\s/g, "").replace(",", "."));
   } else {
-    // 2) fallback : prendre le plus “grand” montant plausible
-    const all = [...normalized.matchAll(/(\d{1,4}\s?[.,]\s?\d{2})\s*(€|EUR)?/gi)].map(m => ({
-      value: parseFloat(m[1].replace(/\s/g, "").replace(",", ".")),
-    }));
-    if (all.length) {
-      amount = all.map(a => a.value).sort((a, b) => b - a)[0];
+    // 2) fallback : prendre le plus grand montant plausible
+    const reAmt = /(\d{1,4}\s?[.,]\s?\d{2})\s*(€|EUR)?/gi;
+    const vals: number[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = reAmt.exec(normalized)) !== null) {
+      vals.push(parseFloat(m[1].replace(/\s/g, "").replace(",", ".")));
+    }
+    if (vals.length) {
+      vals.sort((a, b) => b - a);
+      amount = vals[0];
     }
   }
 
   // --- Date ---
   let date: string | null = null;
   const dateRe = /\b(0?\d|[12]\d|3[01])\s*[/\-.]\s*(0?\d|1[0-2])\s*[/\-.]\s*(\d{2}|\d{4})\b/gi;
-  const matches: Array<{idx: number; d: string; dd: string; mm: string; yy: string}> = [];
-  for (const m of upper.matchAll(dateRe) as any) {
-    const idx = m.index as number;
-    const dd = m[1].toString().padStart(2, "0");
-    const mm = m[2].toString().padStart(2, "0");
-    let yy = m[3].toString();
-    if (yy.length === 2) yy = (2000 + parseInt(yy, 10)).toString();
-    matches.push({ idx, d: `${dd}/${mm}/${yy}`, dd, mm, yy });
+  type Found = { idx: number; d: string };
+  const found: Found[] = [];
+  {
+    let dm: RegExpExecArray | null;
+    while ((dm = dateRe.exec(upper)) !== null) {
+      const idx = dm.index;
+      const dd = dm[1].toString().padStart(2, "0");
+      const mm = dm[2].toString().padStart(2, "0");
+      let yy = dm[3].toString();
+      if (yy.length === 2) yy = (2000 + parseInt(yy, 10)).toString();
+      found.push({ idx, d: `${dd}/${mm}/${yy}` });
+    }
   }
-  if (matches.length) {
-    // Heuristique : date précédée de “ LE ” ou suivie d’une heure “ A 11:45”
+  if (found.length) {
     const hasLE = (i: number) => upper.slice(Math.max(0, i - 6), i + 2).includes(" LE");
     const hasHour = (i: number) => /\sA\s\d{1,2}[:H]\d{2}/i.test(upper.slice(i, i + 20));
-    const scored = matches
-      .map(m => ({ ...m, score: (hasLE(m.idx) ? 2 : 0) + (hasHour(m.idx) ? 1 : 0) }))
-      .sort((a, b) => b.score - a.score || a.idx - b.idx);
-    date = scored[0].d;
+    found.sort((a, b) => {
+      const sa = (hasLE(a.idx) ? 2 : 0) + (hasHour(a.idx) ? 1 : 0);
+      const sb = (hasLE(b.idx) ? 2 : 0) + (hasHour(b.idx) ? 1 : 0);
+      return sb - sa || a.idx - b.idx;
+    });
+    date = found[0].d;
   }
 
-  // --- N° d’autorisation (doublons) ---
+  // --- n° d’autorisation ---
   let auth: string | null = null;
   const auth1 =
     upperDigits.match(/(?:\bNO?\s*AUTO\b|\bAUTH(?:ORISATION|ORIZATION)?\b|AUTORISATION)\s*[:\-]?\s*([A-Z0-9]{6,})/) ||
     upperDigits.match(/\bNO\s*AUTO[:\-]?\s*([A-Z0-9]{6,})/);
   if (auth1) auth = auth1[1];
 
-  // --- Confiance (1..5) ---
+  // --- Score (1..5) ---
   let conf = 0;
   if (isCard) conf += 2;
   if (isConnect) conf += 2;
@@ -564,4 +573,3 @@ function parseTicketFromText(text: string) {
     auth,
   };
 }
-
