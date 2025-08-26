@@ -5,6 +5,10 @@ import Tesseract from "tesseract.js";
 
 /* ---------- UUID compatible mobile (remplace crypto.randomUUID) ---------- */
 function uuidv4() {
+  function makeSourceKey(f: File) {
+  return `${f.name.toLowerCase()}__${f.size}__${f.lastModified}`;
+}
+
   return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
     const r = (Math.random() * 16) | 0;
     const v = c === "x" ? r : (r & 0x3) | 0x8;
@@ -24,8 +28,9 @@ type Ticket = {
   date: string | null;
   confidence: number; // 0..5
   status: "pending" | "done" | "error";
+  duplicate?: boolean;     // si doublon détecté
+  sourceKey?: string;      // clé unique basée sur le fichier
   auth?: string | null;        // NEW : n° d’autorisation extrait
-  duplicate?: boolean;         // NEW : doublon détecté ?
 };
 
 
@@ -132,9 +137,14 @@ export default function Home() {
     // OCR séquentiel
     for (const [idx, file] of files.entries()) {
       try {
-        const { data } = await Tesseract.recognize(file, "fra+eng", {
-          logger: () => {},
-        });
+        const { data } = await Tesseract.recognize(file, "fra", {
+  logger: () => {},
+  workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@4/dist/worker.min.js",
+  corePath:
+    "https://cdn.jsdelivr.net/npm/tesseract.js-core@4/tesseract-core.wasm.js",
+  langPath: "https://tessdata.projectnaptha.com/4.0.0_best",
+});
+
 
         const text = (data.text || "").replace(/\s+/g, " ").trim();
         const parsed = parseTicketFromText(text);
@@ -470,71 +480,104 @@ function hasKeywordNear(s: string, keyword: RegExp, index: number, before = 10, 
   return keyword.test(s.slice(start, end));
 }
 
-function parseTicketFromText(text: string) {
-  const normalized = normalizeOCR(text);
-  const upper = normalized.toUpperCase();
+function parseTicketFromText(rawText: string) {
+  // --- Normalisation robuste pour l'OCR ---
+  const text = rawText
+    .replace(/\r/g, "\n")
+    .replace(/\u00A0/g, " ")               // espaces insécables
+    .replace(/[’']/g, "'")
+    .replace(/[“”]/g, '"')
+    .replace(/[‐-–—]/g, "-");               // différents tirets
 
-  // ---- Type & Provider
-  const hasTRWords = /\b(TITRE\s*RESTAURANT|TICKET\s*RESTAURANT|CONECS)\b/.test(upper);
-  const isCard = /\b(VISA|MASTERCARD|CB|EMV|CONTACTLESS|SANS\s*CONTACT)\b/.test(upper);
-  const isConnect = /\b(EDENRED|TICKET\s*RESTAURANT|TITRE\s*RESTAURANT|CONECS|PLUXEE|SODEXO|SWILE|BIMPLI|APETIZ|UP(?:\s*D[ÉE]JEUNER)?|CH[ÈE]QUE\s*D[ÉE]JEUNER|TR)\b/.test(upper);
+  const upper = text
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")        // retire accents
+    .toUpperCase();
 
+  // Petites corrections d’OCR fréquentes dans les chiffres
+  const upperDigits = upper
+    // exemple : I0I -> 101 ; O confondu avec 0 quand entouré de chiffres
+    .replace(/(?<=\d)O(?=\d)/g, "0")
+    .replace(/(?<=\d)I(?=\d)/g, "1")
+    .replace(/(?<=\d)S(?=\d)/g, "5");
+
+  // -----------------------------
+  // 1) Détection Carte vs Connect
+  // -----------------------------
+  const isCard = /\b(VISA|MASTERCARD|CB|EMV|CONTACTLESS|SANS\s*CONTACT)\b/.test(upperDigits);
+  const isConnect = /\b(EDENRED|TICKET\s*RESTAURANT|PLUXEE|SODEXO|SWILE|BIMPLI|APETIZ|UP(?:\s*DEJEUNER)?|CHEQUE\s*DEJEUNER|TR\b)\b/.test(upperDigits);
+
+  // -----------------------------
+  // 2) Prestataire
+  // -----------------------------
   let provider = "—";
-  if (/\bEDENRED|TICKET\s*RESTAURANT|TITRE\s*RESTAURANT\b/.test(upper)) provider = "Edenred / Ticket Restaurant (Connect)";
-  else if (/\bCONECS\b/.test(upper)) provider = "Conecs (Connect)";
-  else if (/\bPLUXEE|SODEXO\b/.test(upper)) provider = "Pluxee (Connect)";
-  else if (/\bSWILE\b/.test(upper)) provider = "Swile (Connect)";
-  else if (/\bBIMPLI|APETIZ\b/.test(upper)) provider = "Bimpli (Connect)";
-  else if (/\bUP(?:\s*D[ÉE]JEUNER)?|CH[ÈE]QUE\s*D[ÉE]JEUNER\b/.test(upper)) provider = "Up Déjeuner (Connect)";
-  else if (isCard && hasTRWords) provider = "TR Mastercard (carte)";
+  if (/\bEDENRED|TICKET\s*RESTAURANT\b/.test(upperDigits)) provider = "Edenred (Connect)";
+  else if (/\bPLUXEE|SODEXO\b/.test(upperDigits)) provider = "Pluxee (Connect)";
+  else if (/\bSWILE\b/.test(upperDigits)) provider = "Swile (Connect)";
+  else if (/\bBIMPLI|APETIZ\b/.test(upperDigits)) provider = "Bimpli (Connect)";
+  else if (/\bUP(?:\s*DEJEUNER)?|CHEQUE\s*DEJEUNER\b/.test(upperDigits)) provider = "Up Déjeuner (Connect)";
   else if (isCard) provider = "Inconnu (rails bancaires)";
 
-  // ---- Montant
+  // -----------------------------
+  // 3) Montant (prend en priorité après 'MONTANT')
+  // -----------------------------
   let amount: number | null = null;
-  const afterLabel = normalized.match(/MONTANT[^0-9]{0,12}(\d+\s?[.,]\s?\d{2})/i);
-  if (afterLabel) {
-    amount = parseFloat(afterLabel[1].replace(/\s/g, "").replace(",", "."));
-  } else {
-    const all = [...normalized.matchAll(/(\d+\s?[.,]\s?\d{2})\s*(€|EUR)?/gi)].map(
-      (m) => parseFloat(m[1].replace(/\s/g, "").replace(",", "."))
-    );
-    if (all.length) amount = Math.max(...all);
+
+  // a) si "MONTANT" présent, on essaie d'abord là
+  const afterMontant = upperDigits.match(/MONTANT[^\d]{0,20}(\d{1,3}(?:[ .]\d{3})*[.,]\d{2})/);
+  if (afterMontant) {
+    amount = parseFloat(afterMontant[1].replace(/[ .]/g, "").replace(",", "."));
   }
 
-  // ---- Date (évite "FIN 31/07/30", accepte "LE 19/08/25 A 11:45:34")
-  const dateCandidates: {str: string; index: number}[] = [];
-  const dateRe = /(\d{1,2}\s*[/\-\.]\s*\d{1,2}\s*[/\-\.]\s*(\d{2}|\d{4}))(?:\s*A\s*\d{1,2}[:h]\d{2}(?::\d{2})?)?/gi;
-  let dm: RegExpExecArray | null;
-  while ((dm = dateRe.exec(normalized))) {
-    dateCandidates.push({ str: dm[1], index: dm.index });
+  // b) fallback : meilleur nombre en € dans tout le texte
+  if (amount === null) {
+    const candidates = Array.from(
+      upperDigits.matchAll(/\b(\d{1,3}(?:[ .]\d{3})*[.,]\d{2})\s*(?:€|EUR)?\b/g)
+    ).map(m => parseFloat(m[1].replace(/[ .]/g, "").replace(",", ".")));
+
+    if (candidates.length > 0) {
+      // on prend le max pour éviter les faux 0,50 etc. dans les totaux techniques
+      amount = candidates.sort((a, b) => b - a)[0];
+    }
   }
 
+  // -----------------------------
+  // 4) Date (dd/mm/yy(yy), accepte séparateurs et espaces OCR)
+  // -----------------------------
   let date: string | null = null;
-  for (const cand of dateCandidates) {
-    const nearFIN = hasKeywordNear(upper, /\bFIN\b/, cand.index, 5, 5);
-    if (nearFIN) continue; // ignore "FIN 31/07/30"
 
-    const prefers = hasKeywordNear(upper, /\bLE\b/, cand.index, 4, 2)
-                 || hasKeywordNear(normalized, /\sA\s\d{1,2}[:h]\d{2}/i, cand.index, 0, 14);
+  // formats tolérés : 19/08/25, 19-08-2025, 19 . 08 . 25, etc.
+  const dateMatch =
+    upperDigits.match(/\b(0?\d|[12]\d|3[01])\s*[/\-.]\s*(0?\d|1[0-2])\s*[/\-.]\s*(\d{2}|\d{4})\b/) ||
+    null;
 
-    const parts = cand.str.replace(/\s/g, "").split(/[\/\-.]/);
-    let day = parts[0].padStart(2, "0");
-    let month = parts[1].padStart(2, "0");
-    let year = parts[2].length === 2 ? `20${parts[2]}` : parts[2];
-    const dstr = `${day}/${month}/${year}`;
+  if (dateMatch) {
+    let dd = dateMatch[1].padStart(2, "0");
+    let mm = dateMatch[2].padStart(2, "0");
+    let yyyy = dateMatch[3];
 
-    date = dstr;
-    if (prefers) break;
+    if (yyyy.length === 2) {
+      // on suppose 20xx pour les TR modernes
+      const yy = parseInt(yyyy, 10);
+      yyyy = (2000 + yy).toString();
+    }
+    date = `${dd}/${mm}/${yyyy}`;
   }
 
-  // ---- N° d’autorisation (doublons)
+  // -----------------------------
+  // 5) N° d'autorisation (si présent)
+  // -----------------------------
   let auth: string | null = null;
-  const mAuth = normalized.match(
-    /(NO\s*AUTO|N[°º]\s*AUTO|AUTORISATION|AUTH(?:ORISATION|ORIZATION)?)[^A-Z0-9]{0,8}([A-Z0-9]{4,})/i
-  );
-  if (mAuth) auth = mAuth[2];
+  // Cherche un bloc après AUTORISATION / AUTH / NO AUTO…
+  const mAuth =
+    upperDigits.match(/(?:\bNO?\s*AUTO\b|\bAUTH(?:ORISATION|ORIZATION)?\b|AUTORISATION)\s*[:\-]?\s*([A-Z0-9]{6,})/) ||
+    upperDigits.match(/\bNO\s*AUTO[:\-]?\s*([A-Z0-9]{6,})/);
 
-  // ---- Score
+  if (mAuth) auth = mAuth[1];
+
+  // -----------------------------
+  // 6) Score (confiance 1..5)
+  // -----------------------------
   let conf = 0;
   if (isCard) conf += 2;
   if (isConnect) conf += 2;
